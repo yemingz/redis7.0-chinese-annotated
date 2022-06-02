@@ -69,25 +69,25 @@ typedef struct sentinelAddr {
 #define SRI_SLAVE   (1<<1)
 /* 实例是一个 Sentinel */
 #define SRI_SENTINEL (1<<2)
-/* 实例当前状态为: SDOWN */
+/* 实例当前状态为: SDOWN，即哨兵单方面认为对方下线，是一个很主观的想法，主观下线 */
 #define SRI_S_DOWN (1<<3)   /* Subjectively down (no quorum). */
-/* 实例当前状态为：ODOWN */
+/* 实例当前状态为：ODOWN，即大多数（半数以上）哨兵认为对方主观下线，整个哨兵集群达成这个共识，标记为客观下线 */
 #define SRI_O_DOWN (1<<4)   /* Objectively down (confirmed by others). */
 /* Sentinel 认为主服务器已下线 */
 #define SRI_MASTER_DOWN (1<<5) /* A Sentinel with this flag set thinks that
                                    its master is down. */
-/* 正在对主服务器进行故障迁移 */
+/* 正在对主服务器进行故障转移 */
 #define SRI_FAILOVER_IN_PROGRESS (1<<6) /* Failover is in progress for
                                            this master. */
 /* 实例被选中为主服务器（当前仍是从服务器）*/
 #define SRI_PROMOTED (1<<7)            /* Slave selected for promotion. */
-/* 向服务器发送 SLAVEOF 命令，让其转向复制新主服务器 */
+/* 哨兵向服务器发送了 SLAVEOF 命令，让其转向复制新主服务器 */
 #define SRI_RECONF_SENT (1<<8)     /* SLAVEOF <newmaster> sent. */
-/* 从服务器正在和主服务器进行同步 */
+/* 从服务器正在和主服务器进行同步，INFO 响应中从服务器的主能对应上新主，从 SENT -> INPROG */
 #define SRI_RECONF_INPROG (1<<9)   /* Slave synchronization in progress. */
-/* 从服务器与新服务器同步完毕，开始复制新主服务器 */
+/* 从服务器与新服务器同步完毕，INFO 响应中 master_link_status 为 up，从 INPROG -> DONE */
 #define SRI_RECONF_DONE (1<<10)     /* Slave synchronized with new master. */
-/* 主服务器强制执行故障迁移操作 */
+/* 主服务器强制执行故障转移操作，通过 SENTINEL FAILOVER <master-name> 命令主动触发而不用哨兵集群达成共识  */
 #define SRI_FORCE_FAILOVER (1<<11)  /* Force failover with master up. */
 /* 已对返回 -BUSY 的服务器发送 SCRIPT KILL 命令 */
 #define SRI_SCRIPT_KILL_SENT (1<<12) /* SCRIPT KILL already sent on -BUSY */
@@ -102,15 +102,15 @@ typedef struct sentinelAddr {
 static mstime_t sentinel_info_period = 10000;
 /* 发送 PING 命令的间隔 */
 static mstime_t sentinel_ping_period = SENTINEL_PING_PERIOD;
-/* 发送 ASK 命令的间隔 */
+/* 发送 ASK 命令的间隔，实际上是 SENTINEL is-master-down-by-addr 命令，询问对方某主服务器是否主观下线或者故障转移过程中用于拉票（哨兵 leader） */
 static mstime_t sentinel_ask_period = 1000;
 /* 发送 PUBLISH 命令的间隔 */
 static mstime_t sentinel_publish_period = 2000;
-/* 默认判断服务器已下线的时间 */
+/* 默认判断服务器主观下线所需要的时间，即失联多久才会认为对方主观下线 */
 static mstime_t sentinel_default_down_after = 30000;
-/* 默认 TILT 触发时间 */
+/* 默认 TILT 触发时长 */
 static mstime_t sentinel_tilt_trigger = 2000;
-/* 默认 TILT 环境时长 （需要多久才能退出 TITL 模式）*/
+/* 默认 TILT 环境时长（即哨兵正常工作多久后，才能退出 TITL 模式）*/
 static mstime_t sentinel_tilt_period = SENTINEL_PING_PERIOD * 30;
 /* 默认的从服务器配置修改超时时长 */
 static mstime_t sentinel_slave_reconf_timeout = 10000;
@@ -127,13 +127,13 @@ static mstime_t sentinel_default_failover_timeout = 60*3*1000;
 
 /* 默认信息频道 */
 #define SENTINEL_HELLO_CHANNEL "__sentinel__:hello"
-/* 默认的从服务器优先级 */
+/* 默认的从服务器优先级，用于新主选择，优先级越小被选为新主的概率越大，优先级为 0 不参与选择 */
 #define SENTINEL_DEFAULT_SLAVE_PRIORITY 100
-/* 默认同时对新服务器进行复制的从服务器数量 */
+/* 默认同时对新主服务器进行复制的从服务器数量 */
 #define SENTINEL_DEFAULT_PARALLEL_SYNCS 1
 /* 默认最大积压命令数量 */
 #define SENTINEL_MAX_PENDING_COMMANDS 100
-/* 启动故障迁移最大延迟时间 */
+/* 启动故障转移最大延迟时间 */
 #define SENTINEL_MAX_DESYNC 1000
 #define SENTINEL_DEFAULT_DENY_SCRIPTS_RECONFIG 1
 #define SENTINEL_DEFAULT_RESOLVE_HOSTNAMES 0
@@ -141,25 +141,25 @@ static mstime_t sentinel_default_failover_timeout = 60*3*1000;
 
 /* 故障转移时的状态 */
 /* Failover machine different states. */
-/* 不在执行故障迁移 */
+/* 没在执行故障转移 */
 #define SENTINEL_FAILOVER_STATE_NONE 0  /* No failover in progress. */
-/* 正在等待故障迁移的启动 */
+/* 正在等待故障转移的启动 */
 #define SENTINEL_FAILOVER_STATE_WAIT_START 1  /* Wait for failover_start_time*/
-/* 正在为新服务器挑选从服务器 */
+/* 正在挑选将要提升作为新主服务器的从服务器 */
 #define SENTINEL_FAILOVER_STATE_SELECT_SLAVE 2 /* Select slave to promote */
-/* 向被选中的从服务器发送 “send_slaveof_noone” */
+/* 向被选中的从服务器发送  SLAVEOF NO ONE 命令，将其提升为 master */
 #define SENTINEL_FAILOVER_STATE_SEND_SLAVEOF_NOONE 3 /* Slave -> Master */
 /* 等待从服务器转为主服务器 */
 #define SENTINEL_FAILOVER_STATE_WAIT_PROMOTION 4 /* Wait slave to change role */
-/* 向已下线主服务器的其他从服务器发送 SLAVEOF 命令 */
-/* 向它们复制新的主服务器 */
+/* 向已下线主服务器的从属从服务器发送 SLAVEOF new_master_ip new_master_port 命令 */
+/* 让它们向新主服务器建立主从复制，即向新主进行同步 */
 #define SENTINEL_FAILOVER_STATE_RECONF_SLAVES 5 /* SLAVEOF newmaster */
 /* 监视被升级的从服务器 */
 #define SENTINEL_FAILOVER_STATE_UPDATE_CONFIG 6 /* Monitor promoted slave. */
 
-/* 连接正常 */
+/* 主从连接正常 */
 #define SENTINEL_MASTER_LINK_STATUS_UP 0
-/* 连接断开 */
+/* 主从连接断开 */
 #define SENTINEL_MASTER_LINK_STATUS_DOWN 1
 
 /* 可用于多个函数的通用标识。
@@ -187,7 +187,7 @@ static mstime_t sentinel_default_failover_timeout = 60*3*1000;
 #define SENTINEL_SCRIPT_MAX_QUEUE 256
 /* 同一时间可执行脚本的最大数量 */
 #define SENTINEL_SCRIPT_MAX_RUNNING 16
-/* 脚本重试前的延迟时间 */
+/* 脚本最大重试次数 */
 #define SENTINEL_SCRIPT_MAX_RETRY 10
 
 /* SENTINEL SIMULATE-FAILURE command flags. */
